@@ -9,6 +9,8 @@ TODO:
 
 """
 
+import time
+
 import frappe
 
 logger = frappe.logger("payment_reconciliation")
@@ -71,6 +73,7 @@ def bulk_reconcile_all(company="Esnad"):
             receivable_account=receivable_account,
             party_type="Customer",
         )
+        time.sleep(120)
     frappe.msgprint(f"Queued for reconciliation | Customers: {len(customers)}")
     logger.info("Queeud for reconciliation | batches: %s", len(batches))
     return "Done"
