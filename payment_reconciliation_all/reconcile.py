@@ -146,10 +146,10 @@ def reconcile_customer_batch(
                     n_invoices,
                 )
                 success = False
-                try:
-                    e = e
-                except Exception:
-                    e = ""
+            try:
+                e = e
+            except Exception:
+                e = ""
             log = log_customer(customer, success, n_invoices, n_payments, e)
             logger.debug(
                 "Successfully Inserted |log: %s | for customer %s", log, customer
