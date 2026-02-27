@@ -82,20 +82,21 @@ def manage_batch_submission(
         customers[i : i + batch_size] for i in range(0, len(customers), batch_size)
     ]
     for batch in batches:
-        frappe.enqueue(
-            "payment_reconciliation_all.reconcile.reconcile_customer_batch",
-            queue="long",
+        reconcile_customer_batch(
             customer_list=batch,
             company=company,
             receivable_account=receivable_account,
             party_type=party_type,
         )
         time.sleep(sleep_seconds)
+    logger.info(f"Finished processing all {len(customers)} customers.")
+
 
 def reconcile_customer_batch(
     customer_list, company, receivable_account, party_type="Customer"
 ):
     for customer in customer_list:
+        time.sleep(0.2)
         try:
             pr = PaymentReconciliation(
                 {
