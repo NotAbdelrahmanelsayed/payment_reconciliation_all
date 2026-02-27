@@ -61,6 +61,23 @@ def bulk_reconcile_all(company="Esnad"):
     customers = list(customers)
 
     batch_size = 50
+    frappe.msgprint(f"Started background reconciliation for {len(customers)} customers")
+    frappe.enqueue(
+        "payment_reconciliation_all.reconcile.manage_batch_submission",
+        queue="long",
+        customers=customers,
+        company=company,
+        receivable_account=receivable_account,
+        party_type="Customer",
+        batch_size=batch_size,
+        sleep_seconds=30,
+    )
+    return "Done"
+
+
+def manage_batch_submission(
+    customers, company, receivable_account, party_type, batch_size=50, sleep_seconds=30
+):
     batches = [
         customers[i : i + batch_size] for i in range(0, len(customers), batch_size)
     ]
@@ -71,13 +88,9 @@ def bulk_reconcile_all(company="Esnad"):
             customer_list=batch,
             company=company,
             receivable_account=receivable_account,
-            party_type="Customer",
+            party_type=party_type,
         )
-        time.sleep(120)
-    frappe.msgprint(f"Queued for reconciliation | Customers: {len(customers)}")
-    logger.info("Queeud for reconciliation | batches: %s", len(batches))
-    return "Done"
-
+        time.sleep(sleep_seconds)
 
 def reconcile_customer_batch(
     customer_list, company, receivable_account, party_type="Customer"
