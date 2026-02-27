@@ -137,7 +137,7 @@ def reconcile_customer_batch(
 
                 success = True
                 frappe.db.commit()
-            except Exception:
+            except Exception as e:
                 frappe.db.rollback()
                 logger.warning(
                     "Failed to allocate entries |customer: %s | payments: %s.| invoices: %s",
@@ -146,7 +146,7 @@ def reconcile_customer_batch(
                     n_invoices,
                 )
                 success = False
-
+            e = e or ""
             log = log_customer(customer, success, n_invoices, n_payments, e)
             logger.debug(
                 "Successfully Inserted |log: %s | for customer %s", log, customer
