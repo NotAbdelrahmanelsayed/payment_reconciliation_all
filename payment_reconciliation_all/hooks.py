@@ -126,7 +126,9 @@ doctype_js = {"Payment Reconciliation": "public/js/payment_reconciliation.js"}
 
 # Scheduled Tasks
 # ---------------
-
+scheduler_events = {
+    "cron": {"*/5 * * * *": ["payment_reconciliation_all.reconcile.process_batch"]}
+}
 # scheduler_events = {
 # 	"all": [
 # 		"payment_reconciliation_all.tasks.all"

@@ -8,7 +8,7 @@ frappe.ui.form.on("Payment Reconciliation", {
       //     });
       //   }
       frappe.call({
-        method: "payment_reconciliation_all.reconcile.bulk_reconcile_all",
+        method: "payment_reconciliation_all.reconcile.start_reconciliation",
         args: {
           company: frm.company,
         },

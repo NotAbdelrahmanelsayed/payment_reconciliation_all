@@ -1,0 +1,75 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "creation": "2026-02-28 21:00:30.755417",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "company",
+  "total_customers",
+  "processed_customers",
+  "status",
+  "current_batch_start",
+  "current_queue"
+ ],
+ "fields": [
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "fieldname": "total_customers",
+   "fieldtype": "Int",
+   "label": "Total Customers"
+  },
+  {
+   "fieldname": "processed_customers",
+   "fieldtype": "Int",
+   "label": "Processed Customers"
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Not Started\nIn Progress\nCompleted"
+  },
+  {
+   "fieldname": "current_batch_start",
+   "fieldtype": "Data",
+   "label": "Current Batch Start"
+  },
+  {
+   "fieldname": "current_queue",
+   "fieldtype": "Table",
+   "label": "Current Queue",
+   "options": "Reconciliation Queue"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-02-28 22:00:29.396993",
+ "modified_by": "Administrator",
+ "module": "Payment Reconciliation All",
+ "name": "Reconciliation Progress",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
