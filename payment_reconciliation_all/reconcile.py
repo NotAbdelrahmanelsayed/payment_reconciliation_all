@@ -1,160 +1,235 @@
-import json
+"""
+Bulk payment reconciliation for all customers.
+
+Orchestrates the end-to-end process:
+  1. `start_reconciliation` – collects eligible customers and seeds the queue.
+  2. `process_batch`        – called by the scheduler every 5 min; works through
+                              the queue in chunks of 50.
+  3. `reconcile_customer`  – runs ERPNext's PaymentReconciliation for one customer
+                              and writes a Bulk Payment Reconciliation Log entry.
+
+TODO: ignore payments/invoices with a zero amount from reconciliation.
+"""
+
 import time
 
 import frappe
-from frappe.utils.background_jobs import get_jobs
-
-logger = frappe.logger("payment_reconciliation")
-logger.setLevel("DEBUG")
-
-
 from erpnext.accounts.doctype.payment_reconciliation.payment_reconciliation import (
     PaymentReconciliation,
 )
 from erpnext.accounts.party import get_party_account
 from frappe.utils.scheduler import is_scheduler_disabled, is_scheduler_inactive
 
+logger = frappe.logger("payment_reconciliation")
+logger.setLevel("DEBUG")
+
+_BATCH_SIZE = 50
+_STUCK_THRESHOLD_MINUTES = 30
+
 
 @frappe.whitelist()
 def start_reconciliation(company="Esnad"):
+    """Seed the reconciliation queue and kick off processing.
 
+    Guards against double-starts by checking the Reconciliation Progress
+    singleton status. Clears any previous queue before populating a fresh one.
+
+    Args:
+        company (str): ERPNext Company name to reconcile. Defaults to "Esnad".
+    """
     if is_scheduler_disabled() or is_scheduler_inactive():
-        frappe.throw("Please Enable The Scheduler")
+        frappe.throw("Please enable the scheduler before starting reconciliation.")
 
-    # Check if already in progress
     progress = frappe.get_single("Reconciliation Progress")
     if progress.status == "In Progress":
-        frappe.msgprint("Reconciliation already in progress.")
+        frappe.msgprint("Reconciliation is already in progress.")
         return
 
     customers = get_customers_to_reconcile(company)
     if not customers:
-        frappe.msgprint("No customers to reconcile.")
+        frappe.msgprint("No customers need reconciliation.")
         return
 
-    # Clear old queue (if any) and populate new
+    # Reset the singleton and build a fresh queue.
     progress.status = "In Progress"
+    progress.company = company
     progress.total_customers = len(customers)
     progress.processed_customers = 0
-    progress.current_queue = []  # clear child table
-    for cust in customers:
-        progress.append("current_queue", {"customer": cust, "status": "Pending"})
-    progress.company = company
+    progress.current_queue = []  # clears the child table
+    for customer in customers:
+        progress.append("current_queue", {"customer": customer, "status": "Pending"})
     progress.save(ignore_permissions=True)
 
     frappe.msgprint(f"Reconciliation started for {len(customers)} customers.")
 
 
 def get_customers_to_reconcile(company):
-    """
-    Return list of customers having outstanding invoices or unallocated payments
-    """
-    customers = set()
+    """Return a deduplicated list of customers that need reconciliation.
 
-    # TODO Let the user set the company
-    oustanding_invoices = frappe.db.sql(
+    A customer qualifies if they have at least one:
+    - Submitted Sales Invoice with a positive outstanding amount, or
+    - Submitted Payment Entry with a positive unallocated amount.
+
+    Args:
+        company (str): ERPNext Company name used to filter both queries.
+
+    Returns:
+        list[str]: Customer names (no duplicates, order not guaranteed).
+    """
+    outstanding_invoice_rows = frappe.db.sql(
         """
         SELECT DISTINCT customer
         FROM `tabSales Invoice`
-        WHERE docstatus = 1 AND outstanding_amount > 0 AND company = %s
+        WHERE docstatus = 1
+          AND outstanding_amount > 0
+          AND company = %s
         """,
         company,
     )
 
-    # Unallocated Payments
-    unallocated_payments = frappe.db.sql(
+    unallocated_payment_rows = frappe.db.sql(
         """
         SELECT DISTINCT party
         FROM `tabPayment Entry`
-        WHERE docstatus = 1 AND unallocated_amount > 0
-        AND party_type = 'Customer' AND company = %s
+        WHERE docstatus = 1
+          AND unallocated_amount > 0
+          AND party_type = 'Customer'
+          AND company = %s
         """,
         company,
     )
-    for (cust,) in oustanding_invoices:
-        customers.add(cust)
-    for (party,) in unallocated_payments:
-        customers.add(party)
 
-    customers = list(customers)
-    return customers
+    customers = {row[0] for row in outstanding_invoice_rows}
+    customers |= {row[0] for row in unallocated_payment_rows}
+    return list(customers)
 
 
 def process_batch():
+    """Process the next batch of customers from the reconciliation queue.
+
+    Called by the scheduler every 5 minutes (see hooks.py). Each invocation:
+      1. Resets queue items that have been stuck in "Processing" for more than
+         `_STUCK_THRESHOLD_MINUTES`, so they are retried on the next run.
+      2. Claims up to `_BATCH_SIZE` pending items by marking them "Processing".
+      3. Reconciles each claimed customer and updates its queue row and the
+         parent progress counter.
+      4. Marks the overall run "Completed" when the queue is exhausted.
+
+    Commits to the database after each individual customer so that partial
+    progress is preserved even if the job is interrupted.
+    """
     progress = frappe.get_single("Reconciliation Progress")
     if progress.status != "In Progress":
         return
 
-    # Reset stuck "Processing" items older than 30 minutes
-    frappe.db.sql(
-        """
-        UPDATE `tabReconciliation Queue`
-        SET status = 'Pending'
-        WHERE parent = %s AND status = 'Processing' AND modified < NOW() - INTERVAL 30 MINUTE
-    """,
-        progress.name,
-    )
-    frappe.db.commit()
+    _reset_stuck_queue_items(progress.name)
 
-    # Fetch next 50 pending items
-    pending_items = frappe.get_all(
+    pending_queue_items = frappe.get_all(
         "Reconciliation Queue",
         filters={"parent": progress.name, "status": "Pending"},
         fields=["name", "customer"],
-        limit=50,
+        limit=_BATCH_SIZE,
     )
-    if not pending_items:
+
+    if not pending_queue_items:
         progress.status = "Completed"
         progress.save(ignore_permissions=True)
         frappe.db.commit()
         return
 
-    # Mark them as Processing via direct update
-    for item in pending_items:
-        frappe.db.set_value("Reconciliation Queue", item.name, "status", "Processing")
+    # Claim the batch atomically before doing any work.
+    for queue_item in pending_queue_items:
+        frappe.db.set_value("Reconciliation Queue", queue_item.name, "status", "Processing")
     frappe.db.commit()
 
     company = progress.company
-    receivable_account = frappe.db.get_value(
-        "Company", company, "default_receivable_account"
-    )
+    receivable_account = frappe.db.get_value("Company", company, "default_receivable_account")
 
-    for item in pending_items:
-        try:
-            success, log_name = reconcile_customer(
-                item.customer, company, receivable_account
-            )
-            new_status = "Completed" if success else "Failed"
-            frappe.db.set_value(
-                "Reconciliation Queue",
-                item.name,
-                {"status": new_status, "log_reference": log_name, "last_error": None},
-            )
-        except Exception as e:
-            frappe.db.set_value(
-                "Reconciliation Queue",
-                item.name,
-                {"status": "Failed", "last_error": str(e)[:140]},
-            )
-        # Increment parent's processed counter – use set_value on the Single doctype
+    for queue_item in pending_queue_items:
+        _process_queue_item(queue_item, company, receivable_account, progress)
+
+
+def _reset_stuck_queue_items(progress_name):
+    """Reset any queue items stuck in 'Processing' back to 'Pending'.
+
+    This guards against items that were claimed but never finished (e.g. due to
+    a worker crash) holding up the queue indefinitely.
+
+    Args:
+        progress_name (str): The `name` field of the parent Reconciliation Progress doc.
+    """
+    frappe.db.sql(
+        """
+        UPDATE `tabReconciliation Queue`
+        SET status = 'Pending'
+        WHERE parent = %s
+          AND status = 'Processing'
+          AND modified < NOW() - INTERVAL %s MINUTE
+        """,
+        (progress_name, _STUCK_THRESHOLD_MINUTES),
+    )
+    frappe.db.commit()
+
+
+def _process_queue_item(queue_item, company, receivable_account, progress):
+    """Reconcile one customer queue item and persist the result.
+
+    Args:
+        queue_item: Frappe dict with `name` and `customer` fields.
+        company (str): ERPNext Company name.
+        receivable_account (str): Default receivable GL account for the company.
+        progress: The Reconciliation Progress singleton document.
+    """
+    try:
+        success, log_name = reconcile_customer(queue_item.customer, company, receivable_account)
+        new_status = "Completed" if success else "Failed"
         frappe.db.set_value(
-            "Reconciliation Progress",
-            "Reconciliation Progress",
-            "processed_customers",
-            progress.processed_customers + 1,
+            "Reconciliation Queue",
+            queue_item.name,
+            {"status": new_status, "log_reference": log_name, "last_error": None},
         )
-        frappe.db.commit()
-        time.sleep(1)
+    except Exception as error:
+        frappe.db.set_value(
+            "Reconciliation Queue",
+            queue_item.name,
+            {"status": "Failed", "last_error": str(error)[:140]},
+        )
+
+    # Increment the processed counter directly on the Single doctype row.
+    frappe.db.set_value(
+        "Reconciliation Progress",
+        "Reconciliation Progress",
+        "processed_customers",
+        progress.processed_customers + 1,
+    )
+    frappe.db.commit()
+    time.sleep(1)  # gentle pacing to avoid overloading the database
 
 
 def reconcile_customer(customer, company, receivable_account, party_type="Customer"):
+    """Run ERPNext's payment reconciliation for a single customer.
+
+    Fetches all unreconciled entries, allocates payments against invoices, and
+    commits the reconciliation. Always writes a Bulk Payment Reconciliation Log
+    entry regardless of outcome.
+
+    Args:
+        customer (str): Customer name (ERPNext party).
+        company (str): ERPNext Company name.
+        receivable_account (str): Receivable GL account for the company.
+        party_type (str): ERPNext party type. Defaults to "Customer".
+
+    Returns:
+        tuple[bool, str]: (success, log_entry_name) where `success` is True
+            only when allocations were committed without error.
+    """
     time.sleep(0.2)  # gentle pacing
-    n_payments = n_invoices = 0
-    success = False
-    log = None
+
+    invoice_count = payment_count = 0
     error = None
+
     try:
-        pr = PaymentReconciliation(
+        reconciler = PaymentReconciliation(
             {
                 "doctype": "Payment Reconciliation",
                 "company": company,
@@ -163,16 +238,17 @@ def reconcile_customer(customer, company, receivable_account, party_type="Custom
                 "receivable_payable_account": receivable_account,
             }
         )
-        pr.get_unreconciled_entries()
-        n_payments = len(pr.payments)
-        n_invoices = len(pr.invoices)
+        reconciler.get_unreconciled_entries()
 
-        if not pr.payments or not pr.invoices:
-            logger.debug("No payments or invoices for %s", customer)
-            log = log_customer(customer, False, n_invoices, n_payments)
-            return False, log.name
+        invoice_count = len(reconciler.invoices)
+        payment_count = len(reconciler.payments)
 
-        invoices_data = [
+        if not reconciler.payments or not reconciler.invoices:
+            logger.debug("No payments or invoices for customer '%s' — skipping.", customer)
+            log_entry = create_reconciliation_log(customer, False, invoice_count, payment_count)
+            return False, log_entry.name
+
+        invoices = [
             {
                 "invoice_type": inv.invoice_type,
                 "invoice_number": inv.invoice_number,
@@ -180,10 +256,10 @@ def reconcile_customer(customer, company, receivable_account, party_type="Custom
                 "invoice_date": inv.invoice_date,
                 "currency": inv.currency,
             }
-            for inv in pr.invoices
+            for inv in reconciler.invoices
         ]
 
-        payments_data = [
+        payments = [
             {
                 "reference_type": pay.reference_type,
                 "reference_name": pay.reference_name,
@@ -194,58 +270,78 @@ def reconcile_customer(customer, company, receivable_account, party_type="Custom
                 "is_advance": pay.is_advance,
                 "cost_center": pay.cost_center,
             }
-            for pay in pr.payments
+            for pay in reconciler.payments
         ]
 
         try:
-            pr.allocate_entries(
-                frappe._dict({"invoices": invoices_data, "payments": payments_data})
-            )
-            logger.info("Allocated entries for %s", customer)
-            pr.reconcile_allocations()
+            reconciler.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+            logger.info("Entries allocated for customer '%s'.", customer)
+            reconciler.reconcile_allocations()
             frappe.db.commit()
             success = True
-        except Exception as e:
+        except Exception as alloc_error:
             frappe.db.rollback()
-            logger.warning("Allocation failed for %s", customer)
-            error = e
+            logger.warning("Allocation failed for customer '%s': %s", customer, alloc_error)
+            error = alloc_error
             success = False
 
-        log = log_customer(customer, success, n_invoices, n_payments, error)
-        return success, log.name
+        log_entry = create_reconciliation_log(customer, success, invoice_count, payment_count, error)
+        return success, log_entry.name
 
-    except Exception as e:
-        logger.error("Unexpected error for %s: %s", customer, e)
-        log = log_customer(customer, False, 0, 0, e)
-        return False, log.name
+    except Exception as unexpected_error:
+        logger.error("Unexpected error for customer '%s': %s", customer, unexpected_error)
+        log_entry = create_reconciliation_log(customer, False, 0, 0, unexpected_error)
+        return False, log_entry.name
 
-def get_recievable_payable_acc(party, company, party_type="Customer"):
 
+def get_receivable_payable_account(party, company, party_type="Customer"):
+    """Look up the receivable/payable GL account for a given party.
+
+    Args:
+        party (str): ERPNext party name (Customer or Supplier).
+        company (str): ERPNext Company name.
+        party_type (str): "Customer" or "Supplier". Defaults to "Customer".
+
+    Returns:
+        str | None: Account name, or None if the lookup fails.
+    """
     try:
-        rec_pay_acc = get_party_account(party_type, party, company)
-        logger.debug("Party Account %s", party)
-
-    except Exception as e:
+        party_account = get_party_account(party_type, party, company)
+        logger.debug("Resolved party account for '%s': %s", party, party_account)
+        return party_account
+    except Exception as error:
         logger.error(
-            "Couldn't get the party account with party_type: %s. party %s. company %s.",
+            "Could not resolve party account — party_type: %s, party: %s, company: %s. Error: %s",
             party_type,
             party,
             company,
+            error,
         )
+        return None
 
-    return rec_pay_acc
 
+def create_reconciliation_log(customer, success, invoice_count, payment_count, error=None):
+    """Insert a Bulk Payment Reconciliation Log entry and return the document.
 
-def log_customer(customer, success, n_invoices, n_payments, e=None):
-    log = frappe.get_doc(
+    Args:
+        customer (str): Customer name.
+        success (bool): Whether reconciliation succeeded.
+        invoice_count (int): Number of invoices that were considered.
+        payment_count (int): Number of payments that were considered.
+        error (Exception | None): The exception to record on failure, if any.
+
+    Returns:
+        Document: The newly inserted Bulk Payment Reconciliation Log document.
+    """
+    log_entry = frappe.get_doc(
         {
             "doctype": "Bulk Payment Reconciliation Log",
             "customer": customer,
             "status": "Success" if success else "Failed",
-            "error_message": str(e) if not success else None,
-            "invoices_processed": n_invoices,
-            "payments_processed": n_payments,
+            "error_message": str(error) if error else None,
+            "invoices_processed": invoice_count,
+            "payments_processed": payment_count,
         }
     )
-    log.insert(ignore_permissions=True)
-    return log
+    log_entry.insert(ignore_permissions=True)
+    return log_entry
