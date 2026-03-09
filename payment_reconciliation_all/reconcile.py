@@ -198,12 +198,11 @@ def _process_queue_item(queue_item, company, receivable_account):
             {"status": "Failed", "last_error": str(error)[:140]},
         )
 
-    # Increment the processed counter atomically to avoid stale-read overwrites.
-    frappe.db.sql("""
-        UPDATE `tabReconciliation Progress`
-        SET processed_customers = processed_customers + 1
-        WHERE name = 'Reconciliation Progress'
-    """)
+    # Increment the processed counter. Single DocTypes are stored in tabSingles,
+    # not in their own table, so we must use set_value (or the tabSingles ORM).
+    # Sequential batch processing means there is no parallel stale-read risk.
+    current = frappe.db.get_single_value("Reconciliation Progress", "processed_customers") or 0
+    frappe.db.set_single_value("Reconciliation Progress", "processed_customers", current + 1)
     frappe.db.commit()
     time.sleep(1)  # gentle pacing to avoid overloading the database
 
