@@ -66,7 +66,7 @@ def get_customers_to_reconcile(company):
 
     A customer qualifies if they have both:
     - Submitted Sales Invoice with a positive outstanding amount, and
-    - Submitted Payment Entry with a positive unallocated amount.
+    - Submitted Payment Entry or Journal Entry with an unallocated amount.
 
     Args:
         company (str): ERPNext Company name used to filter both queries.
@@ -97,9 +97,28 @@ def get_customers_to_reconcile(company):
         company,
     )
 
-    customers_out = {row[0] for row in outstanding_invoice_rows}
-    customers = {row[0] for row in unallocated_payment_rows if row[0] in customers_out}
-    return list(customers)
+    # Journal Entries: unallocated when reference_type is empty/NULL or a
+    # Sales/Purchase Order (advance), and net credit > 0 (receivable side).
+    unallocated_je_rows = frappe.db.sql(
+        """
+        SELECT DISTINCT jea.party
+        FROM `tabJournal Entry Account` jea
+        INNER JOIN `tabJournal Entry` je ON je.name = jea.parent
+        WHERE je.docstatus = 1
+          AND jea.party_type = 'Customer'
+          AND je.company = %s
+          AND (jea.reference_type IS NULL
+               OR jea.reference_type = ''
+               OR jea.reference_type IN ('Sales Order', 'Purchase Order'))
+          AND (jea.credit_in_account_currency - jea.debit_in_account_currency) > 0
+        """,
+        company,
+    )
+
+    customers_with_invoices = {row[0] for row in outstanding_invoice_rows}
+    customers_with_payments = {row[0] for row in unallocated_payment_rows}
+    customers_with_payments |= {row[0] for row in unallocated_je_rows}
+    return list(customers_with_invoices & customers_with_payments)
 
 
 def process_batch():
